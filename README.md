@@ -37,6 +37,21 @@ Logs: `journalctl --user -u claude-desktop-check`.
 Set `$TERMINAL` to choose the terminal (default: first of ghostty, kitty,
 alacritty, konsole).
 
+## Launcher flags and keyring
+
+`/usr/bin/claude-desktop` uses Wayland when a Wayland session is detected and
+adds the flags from `~/.config/claude-desktop-flags.conf` (one or more per
+line, `#` starts a comment).
+
+Electron picks its secret store from `XDG_CURRENT_DESKTOP`. On desktops it
+does not know (e.g. niri) it stores no secrets, and the app warns "No system
+keyring is available". Choose the store in the flags file, for KWallet:
+
+    --password-store=kwallet6
+
+or `--password-store=gnome-libsecret` with GNOME Keyring. The wallet must be
+unlocked, e.g. at login through PAM. Restart the app after changing it.
+
 ## If Anthropic rotates the signing key
 
 Checks will fail with a critical notification. Get the new fingerprint from
