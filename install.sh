@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Links claude-desktop-pkg into ~/.local/bin and enables the update-check
-# timer. Run with --uninstall to undo. Does not touch the pacman package.
+# Links claude-desktop-pkg into ~/.local/bin, enables the update-check timer
+# and picks the app's keyring. Run with --uninstall to undo. Does not touch the pacman package.
 set -euo pipefail
 
 REPO_DIR=$(dirname "$(readlink -f "$0")")
@@ -24,3 +24,5 @@ done
 systemctl --user daemon-reload
 systemctl --user enable --now claude-desktop-check.timer
 systemctl --user list-timers claude-desktop-check.timer
+# Leaves an existing choice alone; a missing keyring must not fail the install.
+"$REPO_DIR/bin/claude-desktop-pkg" keyring || true

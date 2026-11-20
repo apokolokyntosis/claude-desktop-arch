@@ -7,6 +7,10 @@
 #   claude-desktop-pkg check     like status, but as a desktop notification (timer)
 #   claude-desktop-pkg build     pin the latest version in PKGBUILD and build it
 #   claude-desktop-pkg update    build, then install with pacman
+#   claude-desktop-pkg keyring [STORE]
+#                                set the app's secret store in the flags file;
+#                                without STORE, detect KWallet or GNOME Keyring
+#                                unless one is already set
 #
 # Trust chain: pinned key fingerprint -> InRelease signature (+ Valid-Until)
 # -> SHA256 of the Packages index -> SHA256 of the .deb, which goes into the
@@ -23,6 +27,8 @@ DEB_POOL=pool/main/c/claude-desktop
 KEY_FPR=31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
 KEY_FILE=$REPO_DIR/keys/anthropic-claude-desktop.asc
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-arch
+# Read by the launcher, claude-desktop.sh.
+FLAGS_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/claude-desktop-flags.conf
 
 # Exit codes: 1 = ordinary failure (e.g. offline), 2 = verification failed.
 # `check` raises a critical notification only for 2.
@@ -182,6 +188,42 @@ cmd_build() {
   prune_cache "$ver"
 }
 
+detect_password_store() {
+  if [[ $(busctl --user call org.kde.kwalletd6 /modules/kwalletd6 org.kde.KWallet isEnabled 2>/dev/null) == "b true" ]]; then
+    echo kwallet6
+  elif busctl --user list 2>/dev/null | awk '{ print $1 }' | grep -qx org.freedesktop.secrets; then
+    echo gnome-libsecret
+  fi
+}
+
+# Electron picks its secret store from XDG_CURRENT_DESKTOP and stores no
+# secrets on desktops it does not know (e.g. niri), so the store is set
+# explicitly.
+cmd_keyring() {
+  local store=${1:-} current=""
+  if [[ -r $FLAGS_FILE ]]; then
+    current=$(sed -n 's/^[[:space:]]*--password-store=\([^[:space:]#]*\).*/\1/p' "$FLAGS_FILE" | tail -n1)
+  fi
+  if [[ -z $store ]]; then
+    if [[ -n $current ]]; then
+      echo "already set: --password-store=$current ($FLAGS_FILE)"; return 0
+    fi
+    store=$(detect_password_store)
+    [[ -n $store ]] || { echo "no keyring found: install and unlock KWallet or GNOME Keyring" >&2; return 1; }
+  fi
+  case $store in
+    kwallet6 | kwallet5 | kwallet | gnome-libsecret | basic) ;;
+    *) echo "unknown store '$store' (kwallet6, kwallet5, kwallet, gnome-libsecret, basic)" >&2; return 1 ;;
+  esac
+  mkdir -p "$(dirname "$FLAGS_FILE")"
+  touch "$FLAGS_FILE"
+  # Only replaces the flag when it starts its own line, the way this
+  # command writes it.
+  sed -i '/^[[:space:]]*--password-store=/d' "$FLAGS_FILE"
+  echo "--password-store=$store" >>"$FLAGS_FILE"
+  echo "set --password-store=$store in $FLAGS_FILE; restart Claude Desktop to apply"
+}
+
 pause_on_exit() { local rc=$?; echo; read -rp "Done (exit $rc). Press Enter to close." _; }
 
 case ${1:-} in
@@ -192,5 +234,6 @@ case ${1:-} in
   update)
     [[ ${2:-} == --pause ]] && trap pause_on_exit EXIT
     cmd_build yes ;;
+  keyring) cmd_keyring "${2:-}" ;;
   *) sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 1 ;;
 esac
