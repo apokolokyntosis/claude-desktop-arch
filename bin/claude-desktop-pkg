@@ -85,8 +85,9 @@ cmd_latest() {
   echo "$best_ver $best_sha"
 }
 
+# Prints nothing when the package is not installed.
 installed_version() {
-  pacman -Q "$PKGNAME" 2>/dev/null | awk '{ sub(/-[^-]*$/, "", $2); print $2 }'
+  { pacman -Q "$PKGNAME" 2>/dev/null || true; } | awk '{ sub(/-[^-]*$/, "", $2); print $2 }'
 }
 
 cmd_status() {
@@ -171,7 +172,7 @@ cmd_build() {
   local ver rel
   ver=$(sed -n 's/^pkgver=//p' "$REPO_DIR/PKGBUILD")
   rel=$(sed -n 's/^pkgrel=//p' "$REPO_DIR/PKGBUILD")
-  if [[ $install == yes && $(pacman -Q "$PKGNAME" 2>/dev/null | cut -d' ' -f2) == "$ver-$rel" ]]; then
+  if [[ $install == yes ]] && pacman -Q "$PKGNAME" 2>/dev/null | grep -qxF "$PKGNAME $ver-$rel"; then
     echo "$PKGNAME $ver-$rel is already installed"; return 0
   fi
   mkdir -p "$CACHE_DIR"/{src,build,pkg}
