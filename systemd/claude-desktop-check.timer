@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for Claude Desktop updates after login and every 6 hours
+
+[Timer]
+# Delay after login so the notification daemon is up.
+OnStartupSec=2min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

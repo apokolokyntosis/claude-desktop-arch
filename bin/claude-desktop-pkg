@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Builds, installs and watches the claude-desktop-anthropic package, using
+# Anthropic's GPG-signed apt repository as the only source of truth.
+#
+#   claude-desktop-pkg latest    print the newest verified version and .deb sha256
+#   claude-desktop-pkg status    compare installed and latest version
+#   claude-desktop-pkg check     like status, but as a desktop notification (timer)
+#   claude-desktop-pkg build     pin the latest version in PKGBUILD and build it
+#   claude-desktop-pkg update    build, then install with pacman
+#
+# Trust chain: pinned key fingerprint -> InRelease signature (+ Valid-Until)
+# -> SHA256 of the Packages index -> SHA256 of the .deb, which goes into the
+# PKGBUILD so makepkg checks the download against it.
+set -euo pipefail
+
+REPO_DIR=$(dirname "$(dirname "$(readlink -f "$0")")")
+PKGNAME=claude-desktop-anthropic
+APT_URL=https://downloads.claude.ai/claude-desktop/apt/stable
+DEB_POOL=pool/main/c/claude-desktop
+# Published by Anthropic at https://code.claude.com/docs/en/setup. If they
+# rotate the key, compare the new fingerprint against that page before
+# replacing keys/anthropic-claude-desktop.asc and this value.
+KEY_FPR=31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+KEY_FILE=$REPO_DIR/keys/anthropic-claude-desktop.asc
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-arch
+
+# Exit codes: 1 = ordinary failure (e.g. offline), 2 = verification failed.
+# `check` raises a critical notification only for 2.
+fail_verify() { echo "verification failed: $*" >&2; exit 2; }
+
+fetch() {
+  curl -fsS --proto '=https' --tlsv1.2 --max-time 120 --retry 2 -o "$2" "$1"
+}
+
+# Prints "<version> <sha256>" for the newest claude-desktop amd64 .deb.
+cmd_latest() {
+  # Global, not local: the EXIT trap runs after this function has returned.
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+
+  # gpgv trusts every key in the keyring, so the file must hold exactly the
+  # pinned key and no subkeys.
+  local fprs
+  fprs=$(gpg --show-keys --with-colons "$KEY_FILE" 2>/dev/null | awk -F: '$1 == "fpr" { print $10 }')
+  [[ $fprs == "$KEY_FPR" ]] || fail_verify "$KEY_FILE does not contain exactly key $KEY_FPR"
+  gpg --dearmor <"$KEY_FILE" >"$tmp/key.gpg"
+
+  fetch "$APT_URL/dists/stable/InRelease" "$tmp/InRelease"
+  # Only the output of gpgv is used: text outside the signed part of
+  # InRelease must never be parsed.
+  gpgv --quiet --keyring "$tmp/key.gpg" --output "$tmp/Release" "$tmp/InRelease" 2>"$tmp/gpgv.log" \
+    || fail_verify "bad InRelease signature: $(cat "$tmp/gpgv.log")"
+
+  # Valid-Until stops a mirror or attacker from serving an old, validly
+  # signed index that hides newer (e.g. security) releases.
+  local valid_until
+  valid_until=$(sed -n 's/^Valid-Until: //p' "$tmp/Release")
+  [[ -n $valid_until ]] || fail_verify "Release has no Valid-Until"
+  (( $(date -d "$valid_until" +%s) > $(date +%s) )) || fail_verify "Release expired at $valid_until"
+
+  local index=main/binary-amd64/Packages index_sha
+  index_sha=$(awk -v f="$index" '/^SHA256:/ { s = 1; next } /^[^ ]/ { s = 0 } s && $3 == f { print $1 }' "$tmp/Release")
+  [[ $index_sha =~ ^[0-9a-f]{64}$ ]] || fail_verify "no SHA256 for $index in Release"
+  # by-hash (the repo sets Acquire-By-Hash) avoids a race where the repo is
+  # republished between fetching InRelease and fetching Packages.
+  fetch "$APT_URL/dists/stable/main/binary-amd64/by-hash/SHA256/$index_sha" "$tmp/Packages"
+  [[ $(sha256sum "$tmp/Packages" | cut -d' ' -f1) == "$index_sha" ]] || fail_verify "Packages hash mismatch"
+
+  local best_ver="" best_file="" best_sha="" ver file sha
+  while read -r ver file sha; do
+    if [[ -z $best_ver ]] || (( $(vercmp "$ver" "$best_ver") > 0 )); then
+      best_ver=$ver best_file=$file best_sha=$sha
+    fi
+  done < <(awk -v RS= -F'\n' '{
+      delete f
+      for (i = 1; i <= NF; i++) { p = index($i, ": "); if (p) f[substr($i, 1, p - 1)] = substr($i, p + 2) }
+      if (f["Package"] == "claude-desktop" && f["Architecture"] == "amd64") print f["Version"], f["Filename"], f["SHA256"]
+    }' "$tmp/Packages")
+
+  # These values are written into the PKGBUILD, which makepkg executes as
+  # bash, so they must match strict patterns.
+  [[ $best_ver =~ ^[0-9]+(\.[0-9]+)*$ ]] || fail_verify "unexpected version '$best_ver'"
+  [[ $best_file == "$DEB_POOL/claude-desktop_${best_ver}_amd64.deb" ]] || fail_verify "unexpected filename '$best_file'"
+  [[ $best_sha =~ ^[0-9a-f]{64}$ ]] || fail_verify "unexpected sha256 '$best_sha'"
+  echo "$best_ver $best_sha"
+}
+
+installed_version() {
+  pacman -Q "$PKGNAME" 2>/dev/null | awk '{ sub(/-[^-]*$/, "", $2); print $2 }'
+}
+
+cmd_status() {
+  local latest installed
+  latest=$("$0" latest | cut -d' ' -f1)
+  installed=$(installed_version)
+  echo "installed: ${installed:-none}"
+  echo "latest:    $latest"
+  [[ -n $installed ]] && (( $(vercmp "$latest" "$installed") <= 0 ))
+}
+
+notify() { notify-send --app-name="Claude Desktop" --icon=claude-desktop "$@"; }
+
+open_terminal() {
+  local term=${TERMINAL:-}
+  if [[ -z $term ]]; then
+    for t in ghostty kitty alacritty konsole; do
+      command -v "$t" >/dev/null && { term=$t; break; }
+    done
+  fi
+  [[ -n $term ]] || { notify "No terminal found" "Run: claude-desktop-pkg update"; return 1; }
+  # systemd-run puts the terminal into its own unit; a child of the check
+  # service would be killed when that oneshot service exits.
+  systemd-run --user --collect --quiet -- "$term" -e "$(readlink -f "$0")" update --pause
+}
+
+cmd_check() {
+  local out rc=0 latest installed
+  out=$("$0" latest 2>&1) || rc=$?
+  if (( rc == 2 )); then
+    notify --urgency=critical "Update check failed verification" "$out"
+    echo "$out" >&2; exit 2
+  elif (( rc != 0 )); then
+    # Usually offline; the next timer run retries.
+    echo "$out" >&2; exit 1
+  fi
+  latest=${out%% *}
+  installed=$(installed_version)
+  if [[ -n $installed ]] && (( $(vercmp "$latest" "$installed") <= 0 )); then
+    echo "up to date ($installed)"; return 0
+  fi
+  echo "update available: ${installed:-none} -> $latest"
+  # --action blocks until the notification is clicked or dismissed.
+  local action
+  action=$(notify --action=update="Update now" \
+    "Update available: $latest" "Installed: ${installed:-none}. Verified against Anthropic's signed repository.") || true
+  [[ $action == update ]] && open_terminal
+  return 0
+}
+
+# Writes the verified version and hashes into PKGBUILD and commits the change.
+pin_latest() {
+  local out ver sha launcher_sha cur_ver
+  out=$("$0" latest)
+  read -r ver sha <<<"$out"
+  launcher_sha=$(sha256sum "$REPO_DIR/claude-desktop.sh" | cut -d' ' -f1)
+  cur_ver=$(sed -n 's/^pkgver=//p' "$REPO_DIR/PKGBUILD")
+  if [[ $ver != "$cur_ver" ]]; then
+    sed -i -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=1/" "$REPO_DIR/PKGBUILD"
+  fi
+  # The two sha256sums lines follow the source order: launcher, then .deb.
+  awk -v a="$launcher_sha" -v b="$sha" '
+    /^sha256sums=\(/ { print "sha256sums=(\x27" a "\x27"; getline; print "            \x27" b "\x27)"; next }
+    { print }' "$REPO_DIR/PKGBUILD" >"$REPO_DIR/PKGBUILD.tmp"
+  mv "$REPO_DIR/PKGBUILD.tmp" "$REPO_DIR/PKGBUILD"
+  if ! git -C "$REPO_DIR" diff --quiet -- PKGBUILD; then
+    git -C "$REPO_DIR" commit --quiet -m "Update Claude Desktop to $ver" -- PKGBUILD
+    echo "PKGBUILD pinned to $ver"
+  fi
+}
+
+# Deletes downloads and builds of versions other than the pinned one.
+prune_cache() {
+  local ver=$1
+  find "$CACHE_DIR/src" -maxdepth 1 -name 'claude-desktop_*.deb' ! -name "claude-desktop_${ver}_amd64.deb" -delete 2>/dev/null || true
+  find "$CACHE_DIR/pkg" -maxdepth 1 -name "$PKGNAME-*.pkg.tar.*" ! -name "$PKGNAME-$ver-*" -delete 2>/dev/null || true
+}
+
+cmd_build() {
+  local install=$1
+  pin_latest
+  local ver rel
+  ver=$(sed -n 's/^pkgver=//p' "$REPO_DIR/PKGBUILD")
+  rel=$(sed -n 's/^pkgrel=//p' "$REPO_DIR/PKGBUILD")
+  if [[ $install == yes && $(pacman -Q "$PKGNAME" 2>/dev/null | cut -d' ' -f2) == "$ver-$rel" ]]; then
+    echo "$PKGNAME $ver-$rel is already installed"; return 0
+  fi
+  mkdir -p "$CACHE_DIR"/{src,build,pkg}
+  local args=(--syncdeps --cleanbuild --clean --force)
+  [[ $install == yes ]] && args+=(--install)
+  (cd "$REPO_DIR" && SRCDEST="$CACHE_DIR/src" BUILDDIR="$CACHE_DIR/build" PKGDEST="$CACHE_DIR/pkg" makepkg "${args[@]}")
+  prune_cache "$ver"
+}
+
+pause_on_exit() { local rc=$?; echo; read -rp "Done (exit $rc). Press Enter to close." _; }
+
+case ${1:-} in
+  latest) cmd_latest ;;
+  status) cmd_status ;;
+  check)  cmd_check ;;
+  build)  cmd_build no ;;
+  update)
+    [[ ${2:-} == --pause ]] && trap pause_on_exit EXIT
+    cmd_build yes ;;
+  *) sed -n '2,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 1 ;;
+esac

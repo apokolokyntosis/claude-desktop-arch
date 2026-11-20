@@ -1,0 +1,6 @@
+# Build output when running makepkg by hand instead of claude-desktop-pkg
+/src/
+/pkg/
+*.deb
+*.pkg.tar.*
+/PKGBUILD.tmp
